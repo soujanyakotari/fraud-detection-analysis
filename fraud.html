@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fraud Anomaly Detection</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root{--bg:#f8fafc;--card:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--accent:#dc2626;}
+  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0b1220;--card:#111a2b;--ink:#e6edf7;--muted:#93a3b8;--line:#22314a;--accent:#f87171;}}
+  :root[data-theme="dark"]{--bg:#0b1220;--card:#111a2b;--ink:#e6edf7;--muted:#93a3b8;--line:#22314a;--accent:#f87171;}
+  html,body{background:var(--bg);color:var(--ink);height:100%;}
+  body{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th,td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;}
+  th{color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--card);}
+  .scrollx{overflow-x:auto;max-height:420px;overflow-y:auto;}
+  .bar{height:16px;border-radius:4px;background:linear-gradient(90deg,#22c55e,#eab308,#dc2626);}
+</style>
+</head>
+<body class="min-h-screen">
+<div class="max-w-5xl mx-auto p-4 sm:p-6">
+  <h1 class="text-2xl font-bold mb-1">🕵️ Anomaly Detection for Fraud</h1>
+  <p class="text-sm mb-5" style="color:var(--muted)">Flags suspicious transactions using behavioral rules (spend spikes, off-hours activity, structuring, velocity) blended with a statistical outlier score — all in your browser.</p>
+
+  <div class="card p-4 mb-5">
+    <label class="text-sm font-medium">Transactions CSV</label>
+    <input id="txFile" type="file" accept=".csv" class="block w-full text-sm mt-1"/>
+    <p class="text-xs mt-2" style="color:var(--muted)">Expected columns (flexible naming): timestamp, account_id, amount, merchant_category.</p>
+    <div class="flex flex-wrap gap-2 mt-4">
+      <button id="runBtn" class="px-4 py-2 rounded-lg text-white text-sm font-medium" style="background:var(--accent)">Run Detection</button>
+      <button id="sampleBtn" class="px-4 py-2 rounded-lg text-sm font-medium border" style="border-color:var(--line)">Try with sample data</button>
+    </div>
+  </div>
+
+  <div id="results" class="hidden">
+    <div id="summaryCard" class="card p-4 mb-5"></div>
+
+    <div class="card p-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="font-semibold">Flagged transactions <span id="flagCount" class="text-xs" style="color:var(--muted)"></span></h2>
+        <button onclick="downloadCSV('flagged')" class="text-xs px-3 py-1 rounded border" style="border-color:var(--line)">Export CSV</button>
+      </div>
+      <div class="scrollx"><table id="flagTable"></table></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const ALIASES = {
+  timestamp:['timestamp','date','datetime','transaction_time','txn_time'],
+  account_id:['account_id','account','customer_id','acct_id','user_id'],
+  amount:['amount','amt','value','transaction_amount'],
+  merchant_category:['merchant_category','category','merchant','mcc']
+};
+const STRUCT_THRESHOLD=10000, STRUCT_BAND=500, OFF_HOURS=new Set([1,2,3,4,5]);
+const VELOCITY_WINDOW_MIN=60, VELOCITY_FLAG=4, RISK_FLAG=0.5;
+let state = { flagged: [] };
+
+function norm(s){ return s.trim().toLowerCase().replace(/[\s_-]+/g,'_'); }
+function findCol(headers, aliases){ const map={}; headers.forEach(h=>map[norm(h)]=h); for(const a of aliases) if(map[a]) return map[a]; return null; }
+function splitCSVLine(line){ const out=[]; let cur='',inQ=false; for(const c of line){ if(c==='"') inQ=!inQ; else if(c===','&&!inQ){out.push(cur);cur='';} else cur+=c;} out.push(cur); return out.map(s=>s.trim()); }
+function parseCSV(text){ const lines=text.split(/\r?\n/).filter(l=>l.trim().length); const headers=splitCSVLine(lines[0]); return lines.slice(1).map(l=>{const c=splitCSVLine(l); const row={}; headers.forEach((h,i)=>row[h]=c[i]??''); return row;}); }
+function parseAmount(v){ return parseFloat(String(v).replace(/[\$,]/g,'')); }
+
+function normalizeRows(rows){
+  if(!rows.length) return [];
+  const headers = Object.keys(rows[0]);
+  const tCol=findCol(headers,ALIASES.timestamp), aCol=findCol(headers,ALIASES.account_id);
+  const amCol=findCol(headers,ALIASES.amount), cCol=findCol(headers,ALIASES.merchant_category);
+  if(!tCol||!aCol||!amCol) throw new Error(`Missing required column. Found: ${headers.join(', ')}`);
+  return rows.map(r=>({
+    timestamp: new Date(r[tCol]), account_id: r[aCol], amount: parseAmount(r[amCol]),
+    category: cCol? r[cCol] : 'UNKNOWN'
+  })).filter(r=>!isNaN(r.timestamp) && !isNaN(r.amount))
+    .sort((a,b)=>a.account_id.localeCompare(b.account_id) || a.timestamp-b.timestamp);
+}
+
+function mean(a){ return a.reduce((s,x)=>s+x,0)/(a.length||1); }
+function std(a,m){ if(a.length<2) return 0; return Math.sqrt(a.reduce((s,x)=>s+(x-m)**2,0)/(a.length-1)); }
+
+function engineerAndScore(rows){
+  const globalMean = mean(rows.map(r=>r.amount));
+  const globalStd = std(rows.map(r=>r.amount), globalMean) || 1;
+  const byAcct = {};
+  rows.forEach(r=>{ (byAcct[r.account_id] ??= []).push(r); });
+
+  Object.values(byAcct).forEach(group=>{
+    const seenCats = new Set();
+    group.forEach((r,i)=>{
+      const prior = group.slice(0,i).map(x=>x.amount);
+      const m = prior.length? mean(prior) : globalMean;
+      const s = prior.length>=2? (std(prior,m)||globalStd) : globalStd;
+      r.zscore = (r.amount - m) / s;
+      r.hour = r.timestamp.getHours();
+      r.offHours = OFF_HOURS.has(r.hour);
+      r.nearStructuring = r.amount < STRUCT_THRESHOLD && r.amount >= STRUCT_THRESHOLD - STRUCT_BAND;
+      const windowStart = r.timestamp.getTime() - VELOCITY_WINDOW_MIN*60000;
+      r.velocity = group.slice(0,i).filter(x=>x.timestamp.getTime()>=windowStart).length;
+      r.highVelocity = r.velocity >= VELOCITY_FLAG;
+      r.newCategory = !seenCats.has(r.category); seenCats.add(r.category);
+      r.acctMean = m;
+    });
+  });
+
+  // Rule-based score (transparent)
+  rows.forEach(r=>{
+    let score=0; const reasons=[];
+    if(Math.abs(r.zscore)>=3){ score+=0.35; reasons.push(`Amount is ${r.zscore.toFixed(1)}σ from account's normal spend`); }
+    else if(Math.abs(r.zscore)>=2){ score+=0.15; reasons.push(`Amount is ${r.zscore.toFixed(1)}σ from account's normal spend`); }
+    if(r.offHours){ score+=0.15; reasons.push(`Unusual hour (${r.hour}:00)`); }
+    if(r.nearStructuring){ score+=0.30; reasons.push(`Just under $${STRUCT_THRESHOLD.toLocaleString()} reporting threshold`); }
+    if(r.highVelocity){ score+=0.25; reasons.push(`${r.velocity} transactions in prior ${VELOCITY_WINDOW_MIN} min`); }
+    if(r.newCategory && r.amount>r.acctMean){ score+=0.10; reasons.push('First-time merchant category + above-average spend'); }
+    r.ruleScore = Math.min(score,1);
+    r.reasons = reasons.length? reasons.join('; ') : 'No rule triggered';
+  });
+
+  // Statistical outlier score (Mahalanobis-lite: normalized multi-feature distance)
+  const feats = ['zscore','velocity'];
+  const stats = {};
+  feats.forEach(f=>{ const vals=rows.map(r=>Math.abs(r[f])); stats[f]={m:mean(vals), s:std(vals,mean(vals))||1}; });
+  rows.forEach(r=>{
+    let d=0; feats.forEach(f=>{ d += Math.pow((Math.abs(r[f])-stats[f].m)/stats[f].s,2); });
+    r.outlierRaw = Math.sqrt(d) + (r.nearStructuring?1.5:0) + (r.offHours?0.8:0);
+  });
+  const maxOut = Math.max(...rows.map(r=>r.outlierRaw), 1e-6);
+  rows.forEach(r=>{ r.outlierScore = Math.min(r.outlierRaw/maxOut, 1); });
+
+  rows.forEach(r=>{ r.combined = Math.round((0.5*r.ruleScore + 0.5*r.outlierScore)*1000)/1000; r.flagged = r.combined>=RISK_FLAG; });
+  return rows;
+}
+
+function fmt(n){ return n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function tstr(d){ return d.toISOString().slice(0,16).replace('T',' '); }
+
+function renderResults(rows){
+  document.getElementById('results').classList.remove('hidden');
+  const flagged = rows.filter(r=>r.flagged).sort((a,b)=>b.combined-a.combined);
+  const flaggedAmt = flagged.reduce((s,r)=>s+r.amount,0);
+  document.getElementById('summaryCard').innerHTML = `
+    <h2 class="font-semibold mb-2">Summary</h2>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm mb-3">
+      <div><div style="color:var(--muted)">Total transactions</div><div class="font-semibold">${rows.length}</div></div>
+      <div><div style="color:var(--muted)">Flagged</div><div class="font-semibold">${flagged.length} (${(flagged.length/rows.length*100).toFixed(1)}%)</div></div>
+      <div><div style="color:var(--muted)">Flagged amount</div><div class="font-semibold">$${fmt(flaggedAmt)}</div></div>
+      <div><div style="color:var(--muted)">Flag threshold</div><div class="font-semibold">${RISK_FLAG}</div></div>
+    </div>
+    <div class="bar w-full"></div>
+    <div class="flex justify-between text-xs mt-1" style="color:var(--muted)"><span>Low risk</span><span>High risk</span></div>`;
+  document.getElementById('flagCount').textContent = `(${flagged.length})`;
+  document.getElementById('flagTable').innerHTML = `<tr><th>Risk</th><th>Timestamp</th><th>Account</th><th>Amount</th><th>Category</th><th>Reasons</th></tr>` +
+    flagged.map(r=>`<tr><td><b>${r.combined.toFixed(2)}</b></td><td>${tstr(r.timestamp)}</td><td>${r.account_id}</td><td>$${fmt(r.amount)}</td><td>${r.category}</td><td class="whitespace-normal">${r.reasons}</td></tr>`).join('');
+
+  state.flagged = flagged.map(r=>({timestamp:tstr(r.timestamp),account_id:r.account_id,amount:r.amount,category:r.category,risk_score:r.combined,reasons:r.reasons}));
+}
+
+function toCSV(rows){ if(!rows.length) return ''; const headers=Object.keys(rows[0]); return [headers.join(','), ...rows.map(r=>headers.map(h=>`"${String(r[h]).replace(/"/g,'""')}"`).join(','))].join('\n'); }
+async function downloadCSV(which){
+  const rows = state[which]; if(!rows.length){ alert('No rows to export.'); return; }
+  const csv = toCSV(rows);
+  const downloads = await claude.use('downloads').catch(()=>null);
+  if(downloads){ await downloads.save({filename: which+'.csv', data: csv}); }
+  else { const blob=new Blob([csv],{type:'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=which+'.csv'; a.click(); }
+}
+
+function readFile(input){
+  return new Promise((res,rej)=>{ const f=input.files[0]; if(!f){rej('No file');return;} const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.onerror=rej; fr.readAsText(f); });
+}
+
+document.getElementById('runBtn').onclick = async ()=>{
+  try{
+    const text = await readFile(document.getElementById('txFile'));
+    const rows = normalizeRows(parseCSV(text));
+    renderResults(engineerAndScore(rows));
+  }catch(e){ alert('Error: '+(e.message||e)); }
+};
+
+function generateSample(){
+  const categories=['Groceries','Electronics','Dining','Travel','Utilities','Retail','Gas'];
+  const rows=[]; const start=new Date('2026-09-01');
+  for(let a=0;a<12;a++){
+    const acct=`ACC${1000+a}`;
+    const acctAvg = 40+Math.random()*260;
+    const prefCats = [...categories].sort(()=>Math.random()-0.5).slice(0,3);
+    for(let i=0;i<22;i++){
+      const d = new Date(start.getTime() + Math.floor(Math.random()*25)*86400000 + Math.floor(7+Math.random()*16)*3600000);
+      const amt = Math.max(5, acctAvg + (Math.random()-0.5)*2*acctAvg*0.25);
+      rows.push({timestamp:d.toISOString(), account_id:acct, amount:Math.round(amt*100)/100, merchant_category:prefCats[Math.floor(Math.random()*3)]});
+    }
+    if(Math.random()<0.5){
+      const type = Math.random();
+      if(type<0.34){
+        const d = new Date(start.getTime()+Math.floor(Math.random()*25)*86400000+Math.floor(1+Math.random()*4)*3600000);
+        rows.push({timestamp:d.toISOString(), account_id:acct, amount:Math.round(acctAvg*(8+Math.random()*7)*100)/100, merchant_category:'Electronics'});
+      } else if(type<0.67){
+        const baseDay = Math.floor(Math.random()*20);
+        for(let k=0;k<3;k++){
+          const d = new Date(start.getTime()+(baseDay+k)*86400000+14*3600000);
+          rows.push({timestamp:d.toISOString(), account_id:acct, amount:Math.round((STRUCT_THRESHOLD-(50+Math.random()*450))*100)/100, merchant_category:'Retail'});
+        }
+      } else {
+        const base = new Date(start.getTime()+Math.floor(Math.random()*25)*86400000+13*3600000);
+        for(let k=0;k<6;k++){
+          const d = new Date(base.getTime()+k*7*60000);
+          rows.push({timestamp:d.toISOString(), account_id:acct, amount:Math.round((80+Math.random()*320)*100)/100, merchant_category:'Electronics'});
+        }
+      }
+    }
+  }
+  return normalizeRows(rows);
+}
+document.getElementById('sampleBtn').onclick = ()=>{ renderResults(engineerAndScore(generateSample())); };
+</script>
+</body>
+</html>
